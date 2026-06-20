@@ -39,6 +39,7 @@ const DIFF_ITERS = 12;
 const PRESS_ITERS = 20;
 const DENSITY_DECAY = 0.9995;
 const VELOCITY_DECAY = 0.9995;
+const PARTICLE_COUNT = 500;
 
 const zero4 = () => tf.zeros([1, GRID, GRID, 1]) as tf.Tensor4D;
 const scalarF = (v: number) => tf.scalar(v, 'float32');
@@ -68,6 +69,12 @@ export class FluidSimulator {
   private enforceBoundary!: (t: tf.Tensor4D, decayT: tf.Scalar, invMaskT: tf.Tensor4D) => tf.Tensor4D;
   private gradDiv!: (uIn: tf.Tensor4D, vIn: tf.Tensor4D) => tf.Tensor4D;
   private enforceZeroBoundary!: (t: tf.Tensor4D, invMaskT: tf.Tensor4D) => tf.Tensor4D;
+
+  particlePos!: tf.Tensor2D;
+  private sGrid!: tf.Scalar;
+  private sZero!: tf.Scalar;
+  private sOne!: tf.Scalar;
+  private updateParticlesGpu!: (pos: tf.Tensor2D, uFlat: tf.Tensor1D, vFlat: tf.Tensor1D) => tf.Tensor2D;
 
   obstacles: Obstacle[] = [];
   sources: Source[] = [];
@@ -154,6 +161,94 @@ export class FluidSimulator {
       });
     };
 
+    this.sGrid = scalarF(GRID);
+    this.sZero = scalarF(0);
+    this.sOne = scalarF(1);
+
+    const initPos = new Float32Array(PARTICLE_COUNT * 2);
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      initPos[i * 2] = Math.random() * GRID;
+      initPos[i * 2 + 1] = Math.random() * GRID;
+    }
+    this.particlePos = tf.tensor2d(initPos, [PARTICLE_COUNT, 2], 'float32');
+
+    const gridS = GRID;
+    const dtS = this.dt;
+    const s1Ref = this.sOne;
+    const sGridRef = this.sGrid;
+    const sZeroRef = this.sZero;
+
+    this.updateParticlesGpu = (pos: tf.Tensor2D, uFlat: tf.Tensor1D, vFlat: tf.Tensor1D): tf.Tensor2D => {
+      return tf.tidy(() => {
+        const N = PARTICLE_COUNT;
+
+        const px = tf.slice(pos, [0, 0], [N, 1]) as tf.Tensor2D;
+        const py = tf.slice(pos, [0, 1], [N, 1]) as tf.Tensor2D;
+
+        const x0f = tf.floor(px) as tf.Tensor2D;
+        const y0f = tf.floor(py) as tf.Tensor2D;
+        const x1f = tf.add(x0f, s1Ref) as tf.Tensor2D;
+        const y1f = tf.add(y0f, s1Ref) as tf.Tensor2D;
+
+        const x0 = tf.cast(tf.mod(tf.cast(x0f, 'int32'), GRID), 'float32') as tf.Tensor2D;
+        const y0 = tf.cast(tf.mod(tf.cast(y0f, 'int32'), GRID), 'float32') as tf.Tensor2D;
+        const x1 = tf.cast(tf.mod(tf.cast(x1f, 'int32'), GRID), 'float32') as tf.Tensor2D;
+        const y1 = tf.cast(tf.mod(tf.cast(y1f, 'int32'), GRID), 'float32') as tf.Tensor2D;
+
+        const wx = tf.sub(px, x0f) as tf.Tensor2D;
+        const wy = tf.sub(py, y0f) as tf.Tensor2D;
+
+        const w00 = tf.mul(tf.sub(s1Ref, wx), tf.sub(s1Ref, wy)) as tf.Tensor2D;
+        const w10 = tf.mul(wx, tf.sub(s1Ref, wy)) as tf.Tensor2D;
+        const w01 = tf.mul(tf.sub(s1Ref, wx), wy) as tf.Tensor2D;
+        const w11 = tf.mul(wx, wy) as tf.Tensor2D;
+
+        const y0g = tf.mul(y0, sGridRef) as tf.Tensor2D;
+        const y1g = tf.mul(y1, sGridRef) as tf.Tensor2D;
+        const idx00 = tf.add(y0g, x0) as tf.Tensor2D;
+        const idx10 = tf.add(y0g, x1) as tf.Tensor2D;
+        const idx01 = tf.add(y1g, x0) as tf.Tensor2D;
+        const idx11 = tf.add(y1g, x1) as tf.Tensor2D;
+
+        const idxCat = tf.concat([idx00, idx10, idx01, idx11], 1) as tf.Tensor2D;
+        const idxInt = tf.cast(idxCat, 'int32') as tf.Tensor2D;
+        const idx1d = tf.reshape(idxInt, [N * 4]) as tf.Tensor1D;
+
+        const uVals4 = tf.gather(uFlat, idx1d) as tf.Tensor1D;
+        const vVals4 = tf.gather(vFlat, idx1d) as tf.Tensor1D;
+        const uMat4 = tf.reshape(uVals4, [N, 4]) as tf.Tensor2D;
+        const vMat4 = tf.reshape(vVals4, [N, 4]) as tf.Tensor2D;
+
+        const wMat = tf.concat([w00, w10, w01, w11], 1) as tf.Tensor2D;
+        const wBatch = tf.expandDims(wMat, 1) as tf.Tensor3D;
+        const uBatch = tf.expandDims(uMat4, 2) as tf.Tensor3D;
+        const vBatch = tf.expandDims(vMat4, 2) as tf.Tensor3D;
+
+        const uInterpBatch = tf.matMul(wBatch, uBatch) as tf.Tensor3D;
+        const vInterpBatch = tf.matMul(wBatch, vBatch) as tf.Tensor3D;
+        const uInterp = tf.squeeze(uInterpBatch, [1, 2]) as tf.Tensor1D;
+        const vInterp = tf.squeeze(vInterpBatch, [1, 2]) as tf.Tensor1D;
+        const uCol = tf.expandDims(uInterp, 1) as tf.Tensor2D;
+        const vCol = tf.expandDims(vInterp, 1) as tf.Tensor2D;
+        const vel = tf.concat([uCol, vCol], 1) as tf.Tensor2D;
+
+        const dtScaled = tf.mul(vel, dtS * gridS) as tf.Tensor2D;
+        let newPos = tf.add(pos, dtScaled) as tf.Tensor2D;
+
+        newPos = tf.mod(tf.add(tf.mod(newPos, sGridRef), sGridRef), sGridRef) as tf.Tensor2D;
+
+        const pxNew = tf.slice(newPos, [0, 0], [N, 1]) as tf.Tensor2D;
+        const pyNew = tf.slice(newPos, [0, 1], [N, 1]) as tf.Tensor2D;
+        const nanX = tf.notEqual(pxNew, pxNew) as tf.Tensor2D;
+        const nanY = tf.notEqual(pyNew, pyNew) as tf.Tensor2D;
+        const nanMask2 = tf.tile(tf.logicalOr(nanX, nanY), [1, 2]) as tf.Tensor2D;
+        const resetPos = tf.randomUniform([N, 2], 0, gridS - 0.001, 'float32');
+        const safePos = tf.where(nanMask2, resetPos, newPos) as tf.Tensor2D;
+
+        return safePos;
+      });
+    };
+
     this.initialized = true;
   }
 
@@ -181,6 +276,14 @@ export class FluidSimulator {
     this.d_b = zero4();
     this.mask = zero4();
     this.invMask = tf.sub(this.s1, this.mask) as tf.Tensor4D;
+
+    this.particlePos.dispose();
+    const initPos = new Float32Array(PARTICLE_COUNT * 2);
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      initPos[i * 2] = Math.random() * GRID;
+      initPos[i * 2 + 1] = Math.random() * GRID;
+    }
+    this.particlePos = tf.tensor2d(initPos, [PARTICLE_COUNT, 2], 'float32');
   }
 
   private rebuildMask() {
@@ -461,6 +564,14 @@ export class FluidSimulator {
 
     this.u = uFinal; this.v = vFinal;
     this.d_r = rFinal; this.d_g = gFinal; this.d_b = bFinal;
+
+    const uFlat = tf.reshape(this.u, [GRID * GRID]) as tf.Tensor1D;
+    const vFlat = tf.reshape(this.v, [GRID * GRID]) as tf.Tensor1D;
+    const newPos = this.updateParticlesGpu(this.particlePos, uFlat, vFlat);
+    this.particlePos.dispose();
+    this.particlePos = newPos;
+    uFlat.dispose();
+    vFlat.dispose();
   }
 
   async getVelocityData(): Promise<{ u: Float32Array; v: Float32Array }> {
@@ -480,10 +591,17 @@ export class FluidSimulator {
     return out;
   }
 
+  async getParticlesData(): Promise<Float32Array> {
+    const data = await this.particlePos.data();
+    return new Float32Array(data);
+  }
+
   dispose() {
     [this.u, this.v, this.d_r, this.d_g, this.d_b, this.mask, this.invMask,
      this.lapKernel, this.gradXKernel, this.gradYKernel,
-     this.s1, this.s4, this.sNeg4, this.sDtGrid2
+     this.s1, this.s4, this.sNeg4, this.sDtGrid2,
+     this.sGrid, this.sZero, this.sOne,
+     this.particlePos
     ].forEach(t => t && t.dispose && t.dispose());
     this.initialized = false;
   }

@@ -63,10 +63,11 @@ export default function FluidCanvas({ size = 768 }: Props) {
     const GRID = sim.gridSize;
     const curSize = sizeRef.current;
 
-    const [dens, vel, mask] = await Promise.all([
+    const [dens, vel, mask, particles] = await Promise.all([
       sim.getDensityData(),
       sim.getVelocityData(),
       sim.getMaskData(),
+      sim.getParticlesData(),
     ]);
 
     const imgData = ctx.createImageData(GRID, GRID);
@@ -143,6 +144,26 @@ export default function FluidCanvas({ size = 768 }: Props) {
           vctx.fill();
         }
       }
+    } else if (vecCanvasRef.current) {
+      const vctx = vecCanvasRef.current.getContext('2d')!;
+      vctx.clearRect(0, 0, vecCanvasRef.current.width, vecCanvasRef.current.height);
+    }
+
+    if (vecCanvasRef.current) {
+      const vctx = vecCanvasRef.current.getContext('2d')!;
+      const pscale = curSize / GRID;
+      vctx.fillStyle = 'rgba(255, 255, 255, 0.92)';
+      vctx.shadowColor = 'rgba(255, 255, 255, 0.8)';
+      vctx.shadowBlur = 3;
+      vctx.beginPath();
+      for (let i = 0; i < particles.length; i += 2) {
+        const px = particles[i] * pscale;
+        const py = particles[i + 1] * pscale;
+        vctx.moveTo(px, py);
+        vctx.arc(px, py, 1.8, 0, Math.PI * 2);
+      }
+      vctx.fill();
+      vctx.shadowBlur = 0;
     }
 
     drawObstaclesOverlay();
