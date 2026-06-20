@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import * as tf from '@tensorflow/tfjs';
 import { FluidSimulator, Obstacle } from '@/lib/FluidSimulator';
 import { useFluidStore, Tool } from '@/store/useFluidStore';
 
@@ -15,6 +16,7 @@ export default function FluidCanvas({ size = 768 }: Props) {
   const isDrawingRef = useRef(false);
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
   const prevPosRef = useRef<{ x: number; y: number } | null>(null);
+  const lastFrameRef = useRef(0);
   const [ready, setReady] = useState(false);
   const [showVectors, setShowVectors] = useState(true);
 
@@ -183,36 +185,39 @@ export default function FluidCanvas({ size = 768 }: Props) {
       }
       setReady(true);
 
-      setTimeout(() => {
-        if (stopped || !simRef.current) return;
-        const sim = simRef.current;
-
-        sim.addObstacle({ type: 'circle', x: 0.6, y: 0.55, r: 0.06 });
-
-        for (let k = 0; k < 12; k++) {
-          const off = k * 0.01;
-          sim.addSource({
-            x: 0.3 + off,
-            y: 0.45,
-            u: 0.8,
-            v: -0.1,
-            hue: 200,
-          });
-        }
-        for (let k = 0; k < 8; k++) {
-          const off = k * 0.008;
-          sim.addSource({
-            x: 0.45,
-            y: 0.35 + off,
-            u: -0.2,
-            v: 0.7,
-            hue: 320,
-          });
-        }
-      }, 1500);
+      (window as any).testFluidSim = {
+        sim,
+        runMemoryTest: (seconds = 30) => {
+          console.log(`[TEST] Starting ${seconds}s memory stability test...`);
+          const start = Date.now();
+          const interval = setInterval(() => {
+            const mem = tf.memory();
+            const fps = Math.round(1000 / (performance.now() - lastFrameRef.current));
+            lastFrameRef.current = performance.now();
+            console.log(`[TEST ${Math.round((Date.now() - start) / 1000)}s] Tensors: ${mem.numTensors}, Mem: ${(mem.numBytes / 1024 / 1024).toFixed(2)} MB, FPS: ${fps}`);
+            if (Date.now() - start > seconds * 1000) {
+              clearInterval(interval);
+              console.log(`[TEST] Complete. Final tensor count: ${mem.numTensors}`);
+            }
+          }, 2000);
+        },
+        testObstacleCollision: () => {
+          console.log('[TEST] Adding test obstacle + fluid sources...');
+          sim.addObstacle({ type: 'circle', x: 0.6, y: 0.5, r: 0.08 });
+          for (let k = 0; k < 15; k++) {
+            sim.addSource({ x: 0.2, y: 0.35 + k * 0.01, u: 0.9, v: 0, hue: 200 });
+          }
+          for (let k = 0; k < 10; k++) {
+            sim.addSource({ x: 0.25, y: 0.5 + k * 0.01, u: 0.7, v: 0.1, hue: 320 });
+          }
+          console.log('[TEST] Sources added. Watch for fluid NOT passing through the obstacle.');
+        },
+      };
+      console.log('[TEST] testFluidSim attached to window. Call testFluidSim.testObstacleCollision() or testFluidSim.runMemoryTest()');
 
       let frameCount = 0;
       let lastTime = performance.now();
+      let totalFrames = 0;
       let running = false;
       const loop = async () => {
         if (stopped) return;
@@ -220,12 +225,17 @@ export default function FluidCanvas({ size = 768 }: Props) {
           running = true;
           try {
             frameCount++;
+            totalFrames++;
             const now = performance.now();
             if (now - lastTime >= 500) {
               const fps = Math.round((frameCount * 1000) / (now - lastTime));
               setFps(fps);
               frameCount = 0;
               lastTime = now;
+            }
+            if (totalFrames % 120 === 0) {
+              const mem = tf.memory();
+              console.log(`[Frame ${totalFrames}] Tensors: ${mem.numTensors}, Bytes: ${(mem.numBytes / 1024 / 1024).toFixed(2)} MB, Unreliable: ${mem.unreliable ? 'YES' : 'no'}`);
             }
             if (!stopped) {
               await renderFrame();

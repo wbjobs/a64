@@ -61,6 +61,13 @@ export class FluidSimulator {
   private s4!: tf.Scalar;
   private sNeg4!: tf.Scalar;
   private sDtGrid2!: tf.Scalar;
+  private invMask!: tf.Tensor4D;
+
+  private diffuseStep!: (x: tf.Tensor4D, cur: tf.Tensor4D, aT: tf.Scalar, denom: tf.Scalar) => tf.Tensor4D;
+  private projectStep!: (p: tf.Tensor4D, divT: tf.Tensor4D) => tf.Tensor4D;
+  private enforceBoundary!: (t: tf.Tensor4D, decayT: tf.Scalar, invMaskT: tf.Tensor4D) => tf.Tensor4D;
+  private gradDiv!: (uIn: tf.Tensor4D, vIn: tf.Tensor4D) => tf.Tensor4D;
+  private enforceZeroBoundary!: (t: tf.Tensor4D, invMaskT: tf.Tensor4D) => tf.Tensor4D;
 
   obstacles: Obstacle[] = [];
   sources: Source[] = [];
@@ -73,12 +80,18 @@ export class FluidSimulator {
     await tf.setBackend('webgl');
     await tf.ready();
 
+    this.s1 = scalarF(1);
+    this.s4 = scalarF(4);
+    this.sNeg4 = scalarF(-4);
+    this.sDtGrid2 = scalarF(this.dt * GRID * GRID);
+
     this.u = zero4();
     this.v = zero4();
     this.d_r = zero4();
     this.d_g = zero4();
     this.d_b = zero4();
     this.mask = zero4();
+    this.invMask = tf.sub(this.s1, this.mask) as tf.Tensor4D;
 
     this.lapKernel = tf.tensor4d([
       [[[0]], [[1]], [[0]]],
@@ -95,10 +108,51 @@ export class FluidSimulator {
       [[[0]], [[0]], [[0]]],
       [[[0]], [[0.5]], [[0]]],
     ]);
-    this.s1 = scalarF(1);
-    this.s4 = scalarF(4);
-    this.sNeg4 = scalarF(-4);
-    this.sDtGrid2 = scalarF(this.dt * GRID * GRID);
+
+    const lapK = this.lapKernel;
+    const gxK = this.gradXKernel;
+    const gyK = this.gradYKernel;
+    const sNeg4 = this.sNeg4;
+
+    this.diffuseStep = (x: tf.Tensor4D, cur: tf.Tensor4D, aT: tf.Scalar, denom: tf.Scalar): tf.Tensor4D => {
+      return tf.tidy(() => {
+        const conv = tf.conv2d(cur, lapK, 1, 'same') as tf.Tensor4D;
+        const next = tf.div(tf.add(x, tf.mul(conv, aT)), denom) as tf.Tensor4D;
+        return next;
+      });
+    };
+
+    this.gradDiv = (uIn: tf.Tensor4D, vIn: tf.Tensor4D): tf.Tensor4D => {
+      return tf.tidy(() => {
+        const dx = tf.conv2d(uIn, gxK, 1, 'same') as tf.Tensor4D;
+        const dy = tf.conv2d(vIn, gyK, 1, 'same') as tf.Tensor4D;
+        const div = tf.add(dx, dy) as tf.Tensor4D;
+        return div;
+      });
+    };
+
+    this.projectStep = (p: tf.Tensor4D, divT: tf.Tensor4D): tf.Tensor4D => {
+      return tf.tidy(() => {
+        const lapP = tf.conv2d(p, lapK, 1, 'same') as tf.Tensor4D;
+        const rhs = tf.sub(lapP, divT);
+        const nextP = tf.div(rhs, sNeg4) as tf.Tensor4D;
+        return nextP;
+      });
+    };
+
+    this.enforceBoundary = (t: tf.Tensor4D, decayT: tf.Scalar, invMaskT: tf.Tensor4D): tf.Tensor4D => {
+      return tf.tidy(() => {
+        const masked = tf.mul(t, invMaskT) as tf.Tensor4D;
+        const decayed = tf.mul(masked, decayT) as tf.Tensor4D;
+        return decayed;
+      });
+    };
+
+    this.enforceZeroBoundary = (t: tf.Tensor4D, invMaskT: tf.Tensor4D): tf.Tensor4D => {
+      return tf.tidy(() => {
+        return tf.mul(t, invMaskT) as tf.Tensor4D;
+      });
+    };
 
     this.initialized = true;
   }
@@ -119,17 +173,19 @@ export class FluidSimulator {
   clearAll() {
     this.obstacles = [];
     this.sources = [];
-    [this.u, this.v, this.d_r, this.d_g, this.d_b, this.mask].forEach(t => t.dispose());
+    [this.u, this.v, this.d_r, this.d_g, this.d_b, this.mask, this.invMask].forEach(t => t.dispose());
     this.u = zero4();
     this.v = zero4();
     this.d_r = zero4();
     this.d_g = zero4();
     this.d_b = zero4();
     this.mask = zero4();
+    this.invMask = tf.sub(this.s1, this.mask) as tf.Tensor4D;
   }
 
   private rebuildMask() {
     this.mask.dispose();
+    this.invMask.dispose();
     const arr = new Float32Array(GRID * GRID);
     for (const o of this.obstacles) {
       for (let j = 0; j < GRID; j++) {
@@ -149,6 +205,7 @@ export class FluidSimulator {
       }
     }
     this.mask = tf.tensor4d(arr, [1, GRID, GRID, 1]);
+    this.invMask = tf.sub(this.s1, this.mask) as tf.Tensor4D;
   }
 
   private hslToRgb(h: number, s: number, l: number): [number, number, number] {
@@ -215,19 +272,19 @@ export class FluidSimulator {
   private diffuse(x: tf.Tensor4D, diff: number): tf.Tensor4D {
     const diffS = scalarF(diff);
     const a = tf.mul(this.sDtGrid2, diffS);
-    const denomT = tf.add(this.s1, tf.mul(this.s4, a));
+    const s4a = tf.mul(this.s4, a);
+    const denomT = tf.add(this.s1, s4a);
 
     let cur: tf.Tensor4D = x.clone() as tf.Tensor4D;
     for (let i = 0; i < DIFF_ITERS; i++) {
-      const conv = tf.conv2d(cur, this.lapKernel, 1, 'same') as tf.Tensor4D;
-      const next = tf.div(tf.add(x, tf.mul(conv, a)), denomT) as tf.Tensor4D;
-      conv.dispose();
+      const next = this.diffuseStep(x, cur, a as tf.Scalar, denomT as tf.Scalar);
       cur.dispose();
       cur = next;
     }
 
     diffS.dispose();
     a.dispose();
+    s4a.dispose();
     denomT.dispose();
     return cur;
   }
@@ -235,7 +292,8 @@ export class FluidSimulator {
   private async advectCpu(
     fieldArr: Float32Array,
     uArr: Float32Array,
-    vArr: Float32Array
+    vArr: Float32Array,
+    maskArr: Uint8Array
   ): Promise<Float32Array> {
     const out = new Float32Array(GRID * GRID);
     const dtG = this.dt * GRID;
@@ -243,6 +301,12 @@ export class FluidSimulator {
     for (let j = 0; j < N; j++) {
       for (let i = 0; i < N; i++) {
         const idx = j * N + i;
+
+        if (maskArr[idx]) {
+          out[idx] = 0;
+          continue;
+        }
+
         const x = i - uArr[idx] * dtG;
         const y = j - vArr[idx] * dtG;
 
@@ -251,22 +315,38 @@ export class FluidSimulator {
         let x1 = x0 + 1;
         let y1 = y0 + 1;
 
-        const wx = x - x0;
-        const wy = y - y0;
-
         x0 = Math.max(0, Math.min(N - 1, x0));
         y0 = Math.max(0, Math.min(N - 1, y0));
         x1 = Math.max(0, Math.min(N - 1, x1));
         y1 = Math.max(0, Math.min(N - 1, y1));
 
-        const f00 = fieldArr[y0 * N + x0];
-        const f10 = fieldArr[y0 * N + x1];
-        const f01 = fieldArr[y1 * N + x0];
-        const f11 = fieldArr[y1 * N + x1];
+        const wx = x - x0;
+        const wy = y - y0;
 
-        const c0 = f00 * (1 - wx) + f10 * wx;
-        const c1 = f01 * (1 - wx) + f11 * wx;
-        out[idx] = c0 * (1 - wy) + c1 * wy;
+        const m00 = maskArr[y0 * N + x0];
+        const m10 = maskArr[y0 * N + x1];
+        const m01 = maskArr[y1 * N + x0];
+        const m11 = maskArr[y1 * N + x1];
+
+        let f00 = m00 ? 0 : fieldArr[y0 * N + x0];
+        let f10 = m10 ? 0 : fieldArr[y0 * N + x1];
+        let f01 = m01 ? 0 : fieldArr[y1 * N + x0];
+        let f11 = m11 ? 0 : fieldArr[y1 * N + x1];
+
+        if (m00 || m10 || m01 || m11) {
+          let wSum = 0;
+          if (!m00) { const w = (1 - wx) * (1 - wy); f00 *= w; wSum += w; }
+          if (!m10) { const w = wx * (1 - wy); f10 *= w; wSum += w; }
+          if (!m01) { const w = (1 - wx) * wy; f01 *= w; wSum += w; }
+          if (!m11) { const w = wx * wy; f11 *= w; wSum += w; }
+          const c0 = f00 + f10;
+          const c1 = f01 + f11;
+          out[idx] = wSum > 0 ? (c0 + c1) / wSum : 0;
+        } else {
+          const c0 = f00 * (1 - wx) + f10 * wx;
+          const c1 = f01 * (1 - wx) + f11 * wx;
+          out[idx] = c0 * (1 - wy) + c1 * wy;
+        }
       }
     }
     return out;
@@ -277,28 +357,25 @@ export class FluidSimulator {
     uF: tf.Tensor4D,
     vF: tf.Tensor4D
   ): Promise<tf.Tensor4D> {
-    const [f, u, v] = await Promise.all([
+    const [f, u, v, m] = await Promise.all([
       field.data() as Promise<Float32Array>,
       uF.data() as Promise<Float32Array>,
       vF.data() as Promise<Float32Array>,
+      this.mask.data(),
     ]);
-    const outData = await this.advectCpu(f, u, v);
+    const maskArr = new Uint8Array(m.length);
+    for (let i = 0; i < m.length; i++) maskArr[i] = m[i] > 0.5 ? 1 : 0;
+    const outData = await this.advectCpu(f, u, v, maskArr);
     const result = tf.tensor4d(outData, [1, GRID, GRID, 1]);
     return result as tf.Tensor4D;
   }
 
   private project(uIn: tf.Tensor4D, vIn: tf.Tensor4D): [tf.Tensor4D, tf.Tensor4D] {
-    const dx = tf.conv2d(uIn, this.gradXKernel, 1, 'same') as tf.Tensor4D;
-    const dy = tf.conv2d(vIn, this.gradYKernel, 1, 'same') as tf.Tensor4D;
-    const div = tf.add(dx, dy) as tf.Tensor4D;
-    dx.dispose(); dy.dispose();
+    const div = this.gradDiv(uIn, vIn);
 
     let p: tf.Tensor4D = tf.zerosLike(div) as tf.Tensor4D;
     for (let i = 0; i < PRESS_ITERS; i++) {
-      const lapP = tf.conv2d(p, this.lapKernel, 1, 'same') as tf.Tensor4D;
-      const rhs = tf.sub(lapP, div);
-      const nextP = tf.div(rhs, this.sNeg4) as tf.Tensor4D;
-      lapP.dispose(); rhs.dispose();
+      const nextP = this.projectStep(p, div);
       p.dispose();
       p = nextP;
     }
@@ -307,22 +384,31 @@ export class FluidSimulator {
     const pY = tf.conv2d(p, this.gradYKernel, 1, 'same') as tf.Tensor4D;
     const uOut = tf.sub(uIn, pX) as tf.Tensor4D;
     const vOut = tf.sub(vIn, pY) as tf.Tensor4D;
-    div.dispose(); p.dispose(); pX.dispose(); pY.dispose();
+
+    div.dispose();
+    p.dispose();
+    pX.dispose();
+    pY.dispose();
     return [uOut, vOut];
   }
 
   private applyBoundaryMask(t: tf.Tensor4D, decay: number | null): tf.Tensor4D {
-    const invMask = tf.sub(this.s1, this.mask);
-    const out: tf.Tensor4D = decay === null
-      ? tf.mul(t, invMask) as tf.Tensor4D
-      : (() => {
-          const dS = scalarF(decay);
-          const r = tf.mul(tf.mul(t, invMask), dS) as tf.Tensor4D;
-          dS.dispose();
-          return r;
-        })();
-    invMask.dispose();
-    return out;
+    if (decay === null) {
+      return this.enforceZeroBoundary(t, this.invMask);
+    }
+    const decayT = scalarF(decay);
+    const result = this.enforceBoundary(t, decayT, this.invMask);
+    decayT.dispose();
+    return result;
+  }
+
+  private enforceObstacleCollision(u: tf.Tensor4D, v: tf.Tensor4D, r: tf.Tensor4D, g: tf.Tensor4D, b: tf.Tensor4D): [tf.Tensor4D, tf.Tensor4D, tf.Tensor4D, tf.Tensor4D, tf.Tensor4D] {
+    const uOut = this.enforceZeroBoundary(u, this.invMask);
+    const vOut = this.enforceZeroBoundary(v, this.invMask);
+    const rOut = this.enforceZeroBoundary(r, this.invMask);
+    const gOut = this.enforceZeroBoundary(g, this.invMask);
+    const bOut = this.enforceZeroBoundary(b, this.invMask);
+    return [uOut, vOut, rOut, gOut, bOut];
   }
 
   async step() {
@@ -369,8 +455,12 @@ export class FluidSimulator {
     const b1 = this.applyBoundaryMask(b1T, DENSITY_DECAY);
     r1T.dispose(); g1T.dispose(); b1T.dispose();
 
-    this.u = u3; this.v = v3;
-    this.d_r = r1; this.d_g = g1; this.d_b = b1;
+    const [uFinal, vFinal, rFinal, gFinal, bFinal] = this.enforceObstacleCollision(u3, v3, r1, g1, b1);
+    u3.dispose(); v3.dispose();
+    r1.dispose(); g1.dispose(); b1.dispose();
+
+    this.u = uFinal; this.v = vFinal;
+    this.d_r = rFinal; this.d_g = gFinal; this.d_b = bFinal;
   }
 
   async getVelocityData(): Promise<{ u: Float32Array; v: Float32Array }> {
@@ -391,7 +481,7 @@ export class FluidSimulator {
   }
 
   dispose() {
-    [this.u, this.v, this.d_r, this.d_g, this.d_b, this.mask,
+    [this.u, this.v, this.d_r, this.d_g, this.d_b, this.mask, this.invMask,
      this.lapKernel, this.gradXKernel, this.gradYKernel,
      this.s1, this.s4, this.sNeg4, this.sDtGrid2
     ].forEach(t => t && t.dispose && t.dispose());
